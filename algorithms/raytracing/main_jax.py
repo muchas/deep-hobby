@@ -50,55 +50,86 @@ def refract(vector: jnp.array, normal: jnp.array, refraction_ratio: float) -> jn
     return r_out_perp + r_out_parallel
 
 
-class Ray:
-    def __init__(self, origin: jnp.array, direction: jnp.array):
-        self.origin = origin
-        self.direction = direction
-
-    def at(self, t: float) -> jnp.array:
-        return self.origin + t * self.direction
+class Ray(NamedTuple):
+    origin: jnp.array
+    direction: jnp.array
 
 
-class ScatteredRay:
-    def __init__(self, ray: Ray, attenuation: jnp.array):
-        self.ray = ray
-        self.attenuation = attenuation
+def at(ray, t):
+    return ray.origin + t * ray.direction
 
 
-class Hittable:
-    def hit(self, prng_key, ray: Ray, t_min: float, t_max: float) -> float:
-        raise NotImplemented()
+class ScatteredRay(NamedTuple):
+    ray: Ray
+    attenuation: jnp.array
 
 
-class HitRecordV2(NamedTuple):
+class Intersection(NamedTuple):
     was_hit: bool
     ray_direction: jnp.array
     t: float
     hit_point: jnp.array
     normal: jnp.array
-    scattered_ray_direction: jnp.array
-    scattered_ray_attenuation: jnp.array
+    material_index: int
 
 
-MISSED_HIT_RECORD = HitRecordV2(
+class HitRecord(NamedTuple):
+    intersection: Intersection
+    scattered_ray: ScatteredRay
+
+    @property
+    def was_hit(self):
+        return self.intersection.was_hit
+
+    @property
+    def ray_direction(self):
+        return self.intersection.ray_direction
+
+    @property
+    def t(self):
+        return self.intersection.t
+
+    @property
+    def hit_point(self):
+        return self.intersection.hit_point
+
+    @property
+    def normal(self):
+        return self.intersection.normal
+
+
+EMPTY_INTERSECTION = Intersection(
     was_hit=jnp.array([False], dtype=jnp.int32),
     ray_direction=vector(0, 0, 0),
     t=jnp.inf,
     hit_point=vector(0, 0, 0),
     normal=vector(0, 0, 0),
-    scattered_ray_direction=vector(0, 0, 0),
-    scattered_ray_attenuation=vector(0, 0, 0),
-)       
+    material_index=0,
+)
+
+MISSED_HIT_RECORD = HitRecord(
+    intersection=EMPTY_INTERSECTION,
+    scattered_ray=ScatteredRay(
+        ray=Ray(origin=vector(0, 0, 0), direction=vector(0, 0, 0),),
+        attenuation=vector(0, 0, 0),
+    ),
+)
 
 
-class SphereV2(Hittable):
-    def __init__(self, origin: jnp.array, radius: float, material):
+class SceneObject:
+    def intersect(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
+        raise NotImplemented()
+
+
+class Sphere(SceneObject):
+    def __init__(self, origin: jnp.array, radius: float, material_index: int):
         self.origin = origin
         self.radius = radius
-        self.material = material
+        self.material_index = material_index
 
-    def hit(self, prng_key, ray: Ray, t_min: float, t_max: float) -> HitRecordV2:
-        material = self.material
+    @partial(jit, static_argnums=(0,))
+    def intersect(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
+        material_index = self.material_index
         sphere_origin = self.origin
         sphere_radius = self.radius
 
@@ -111,8 +142,8 @@ class SphereV2(Hittable):
         discriminant = b ** 2 - a * c
 
         @jit
-        def hit_record(t):
-            hitpoint = ray.at(t)
+        def intersection(t):
+            hitpoint = at(ray, t)
             outward_normal = (hitpoint - sphere_origin) / sphere_radius
 
             normal = lax.cond(
@@ -120,17 +151,13 @@ class SphereV2(Hittable):
                 lambda: outward_normal,
                 lambda: -outward_normal,
             )
-
-            scattered_ray = material.scatter(prng_key, hitpoint, normal, ray.direction)
-
-            return HitRecordV2(
+            return Intersection(
                 was_hit=jnp.array([True], dtype=jnp.int32),
                 ray_direction=ray.direction,
                 t=t,
                 hit_point=hitpoint,
                 normal=normal,
-                scattered_ray_direction=scattered_ray.ray.direction,
-                scattered_ray_attenuation=scattered_ray.attenuation,
+                material_index=material_index,
             )
 
         @jit
@@ -140,32 +167,38 @@ class SphereV2(Hittable):
             t2 = (-b - delta_sqrt) / a
             return lax.cond(
                 (t_min < t1) & (t1 < t2),
-                lambda: hit_record(t1),
+                lambda: intersection(t1),
                 lambda: lax.cond(
-                    t_min < t2, lambda: hit_record(t2), lambda: MISSED_HIT_RECORD
+                    t_min < t2, lambda: intersection(t2), lambda: EMPTY_INTERSECTION
                 ),
             )
 
         return lax.cond(
             discriminant > 0,
             lambda: determine_hitpoint(discriminant),
-            lambda: MISSED_HIT_RECORD,
+            lambda: EMPTY_INTERSECTION,
         )
 
 
-class WorldV2:
-    def __init__(self, objects: List[Hittable]):
-        self.objects = objects
+class World:
+    def __init__(self, scene_objects: List[SceneObject]):
+        self.scene_objects = scene_objects
 
-    def hit(self, prng_key, ray: Ray, t_min: float, t_max: float) -> HitRecordV2:
-        hit_records = [hittable.hit(prng_key, ray, t_min, t_max) for hittable in self.objects]
-        min_t_object_index = jnp.argmin(jnp.stack([hit_record.t for hit_record in hit_records]))
-
-        conditions = []
-        for obj_idx in range(len(hit_records)):
-            conditions.append(min_t_object_index == obj_idx)
-
-        return tree_map(lambda *x: jnp.select(conditions, x), *hit_records)
+    @partial(jit, static_argnums=(0,))
+    def find_closest_intersection(
+        self, ray: Ray, t_min: float, t_max: float
+    ) -> Intersection:
+        intersections = [
+            scene_object.intersect(ray, t_min, t_max)
+            for scene_object in self.scene_objects
+        ]
+        min_t_object_index = jnp.argmin(
+            jnp.stack([intersection.t for intersection in intersections])
+        )
+        conditions = [
+            min_t_object_index == obj_idx for obj_idx in range(len(intersections))
+        ]
+        return tree_map(lambda *x: jnp.select(conditions, x), *intersections)
 
 
 class Camera:
@@ -236,10 +269,10 @@ class Material:
         raise NotImplemented()
 
 
-class Lambertian(Material):
-    def __init__(self, albedo):
-        self.albedo = albedo
+class Lambertian(NamedTuple):
+    albedo: jnp.array
 
+    # @partial(jit, static_argnums=(0,))
     def scatter(self, prgn_key, hit_point, normal, _ray_direction) -> ScatteredRay:
         random_unit_vector = unit(
             random.uniform(prgn_key, (3,), minval=-1.0, maxval=1.0)
@@ -251,10 +284,9 @@ class Lambertian(Material):
         )
 
 
-class Metal(Material):
-    def __init__(self, albedo, fuzziness: float = 0.0):
-        self.albedo = albedo
-        self.fuzziness = fuzziness
+class Metal(NamedTuple):
+    albedo: jnp.array
+    fuzziness: float = 0.0
 
     def scatter(self, prgn_key, hit_point, normal, ray_direction) -> ScatteredRay:
         random_unit_vector = unit(
@@ -307,26 +339,76 @@ class Dielectric(Material):
         return r_0 + (1 - r_0) * ((1 - cosine) ** 5)
 
 
+# @partial(jit, static_argnames=["materials"])
+def scatter_with_material_type(
+    prng_key, intersection: Intersection, materials
+) -> ScatteredRay:
+    conditions = [
+        intersection.material_index == material_index
+        for material_index in range(len(materials))
+    ]
+    material = tree_map(lambda *x: jnp.select(conditions, x), *materials)
+    return material.scatter(
+        prng_key,
+        intersection.hit_point,
+        intersection.normal,
+        intersection.ray_direction,
+    )
+
+
+def scatter(
+    prng_key, intersection: Intersection, lambertian_materials, metal_materials
+) -> ScatteredRay:
+    # TODO(smucha): improve disaptch extensibility to multiple material types
+    return lax.cond(
+        intersection.material_index < len(lambertian_materials),
+        lambda: scatter_with_material_type(
+            prng_key, intersection, lambertian_materials
+        ),
+        lambda: scatter_with_material_type(
+            prng_key,
+            intersection._replace(
+                material_index=intersection.material_index - len(lambertian_materials)
+            ),
+            metal_materials,
+        ),
+    )
+
+
 # it's important for this function to be jittable, so it could be executed on a target device as a single kernel
 def compute_ray_color(
-    ray_direction, seed, ray_origin, world, max_scatter_steps: int = 4
+    ray_direction,
+    seed,
+    ray_origin,
+    world,
+    lambertian_materials,
+    metal_materials,
+    max_scatter_steps: int = 4,
 ) -> jnp.array:
     ray = Ray(ray_origin, ray_direction)
 
     prng_key = random.PRNGKey(seed[0])
     prng_keys = random.split(prng_key, num=max_scatter_steps + 1)
 
-    hit_record = world.hit(prng_key, ray, 0.001, jnp.inf)
-    all_hit_records = [hit_record]
+    intersection = world.find_closest_intersection(ray, 0.001, jnp.inf)
+    scattered_ray = scatter(
+        prng_keys[0], intersection, lambertian_materials, metal_materials
+    )
+    all_hit_records = [HitRecord(intersection, scattered_ray)]
 
-    for scatter_step in range(max_scatter_steps):
-        new_hit_record = lax.cond(
-            jnp.all(hit_record.was_hit),
-            lambda: world.hit(prng_keys[scatter_step], Ray(hit_record.hit_point, hit_record.scattered_ray_direction), 0.001, jnp.inf),
-            lambda: MISSED_HIT_RECORD,
+    for scatter_step in range(1, max_scatter_steps):
+        last_hit_record = all_hit_records[-1]
+        intersection = lax.cond(
+            jnp.all(last_hit_record.was_hit),
+            lambda: world.find_closest_intersection(
+                last_hit_record.scattered_ray.ray, 0.001, jnp.inf
+            ),
+            lambda: EMPTY_INTERSECTION,
         )
-        all_hit_records.append(new_hit_record)
-        hit_record = new_hit_record
+        scattered_ray = scatter(
+            prng_keys[scatter_step], intersection, lambertian_materials, metal_materials
+        )
+        all_hit_records.append(HitRecord(intersection, scattered_ray))
 
     initial_color = lax.cond(
         jnp.all(all_hit_records[-1].was_hit),
@@ -338,7 +420,7 @@ def compute_ray_color(
     for hit_record in all_hit_records[::-1]:
         final_color = lax.cond(
             jnp.all(hit_record.was_hit),
-            lambda c: hit_record.scattered_ray_attenuation * c,
+            lambda c: hit_record.scattered_ray.attenuation * c,
             lambda c: c,
             final_color,
         )
@@ -346,7 +428,7 @@ def compute_ray_color(
 
 
 def background_color(ray):
-    t = (unit(ray.at(1))[1] + 1) / 2
+    t = (unit(at(ray, 1))[1] + 1) / 2
     return (1 - t) * color(0, 0, 1) + t * color(1, 1, 1)
 
 
@@ -374,8 +456,64 @@ def write_ppm_image(image: jnp.array, max_color: int = 255) -> str:
     return "".join(output_lines)
 
 
+def generate_random_lambertian(prng_key):
+    albedo = random.uniform(
+        prng_key, shape=(3,), dtype=jnp.float32, minval=0.05, maxval=0.95
+    )
+    return Lambertian(albedo)
+
+
+def generate_random_metal(prng_key):
+    albedo_key, fuzziness_key = random.split(prng_key, num=2)
+
+    albedo = random.uniform(
+        albedo_key, shape=(3,), dtype=jnp.float32, minval=0.05, maxval=0.95
+    )
+    fuzziness = random.uniform(
+        fuzziness_key, shape=(1,), dtype=jnp.float32, minval=0.0, maxval=0.3
+    )
+
+    return Metal(albedo, fuzziness=fuzziness)
+
+
+def generate_random_sphere(prng_key, material_idx):
+    x_key, z_key, size_key, material_key = random.split(prng_key, num=4)
+
+    x = random.uniform(x_key, minval=-5, maxval=5)
+    z = random.uniform(z_key, minval=0.0, maxval=2.0)
+    size = random.uniform(size_key, minval=0.1, maxval=0.25)
+    # material_idx = random.choice(material_key, jnp.array(list(range(len(materials))), dtype=jnp.int32))
+
+    return Sphere(vector(x, -0.3, -0.3 - z), size, material_idx)
+
+
+def generate_random_scene(
+    prng_key,
+    number_of_spheres: int,
+    number_of_lambertian_materials: int,
+    number_of_metal_materials: int,
+):
+    # split prng keys
+    lambertian_prng_key, metal_prng_key, scene_prng_key = random.split(prng_key, num=3)
+
+    lambertian_prng_keys = random.split(
+        lambertian_prng_key, num=number_of_lambertian_materials
+    )
+    lambertian_materials = [
+        generate_random_lambertian(key) for key in lambertian_prng_keys
+    ]
+    metal_prng_keys = random.split(metal_prng_key, num=number_of_metal_materials)
+    metal_materials = [generate_random_metal(key) for key in metal_prng_keys]
+    materials = lambertian_materials + metal_materials
+    scene_prng_keys = random.split(scene_prng_key, num=number_of_spheres)
+    scene = [
+        generate_random_sphere(key, material_idx=(i % len(materials))) for i, key in enumerate(scene_prng_keys)
+    ]
+    return scene, lambertian_materials, metal_materials
+
+
 def main():
-    seed = 0
+    seed = 7
     aspect_ratio = 16 / 9
     image_width = 512
     image_height = int(image_width / aspect_ratio)
@@ -391,25 +529,21 @@ def main():
         viewport_size=(viewport_width, viewport_height),
     )
 
-    # starting_scene = [
-    # 	Sphere(vector(0, 0, -1), 0.5),
-    #    	Sphere(vector(0.0, -100.5, -1.0), 100)  # ground
-    # ]
+    scene, lambertian_materials, metal_materials = generate_random_scene(
+        starting_key,
+        number_of_spheres=15,
+        number_of_lambertian_materials=1,
+        number_of_metal_materials=6,
+    )
 
     material_ground = Lambertian(vector(0.8, 0.8, 0.0))
-    material_center = Lambertian(vector(0.1, 0.2, 0.5))
-    # material_left = Dielectric(1.5)
-    material_right = Metal(vector(0.8, 0.6, 0.2), fuzziness=0.1)
 
-    second_scene = [
-        SphereV2(vector(-1, 0, -0.75), 0.2, material_center),
-        SphereV2(vector(1, 0, -1), 0.5, material_center),
-        SphereV2(vector(0, -0.2, -1.5), 0.25, material_right),
-        SphereV2(vector(-0.6, -0.2, -1.5), 0.25, material_right),
-        SphereV2(vector(0.0, -100.5, -1.0), 100, material_ground),  # ground
-    ]
+    lambertian_materials.append(material_ground)
+    scene.append(Sphere(vector(0.0, -100.5, -1.0), 100, len(lambertian_materials) - 1))
 
-    world = WorldV2(second_scene)
+    materials = lambertian_materials + metal_materials
+
+    world = World(scene)
 
     samples_per_pixel = 50
     batch_size = 10
@@ -418,10 +552,16 @@ def main():
         shape=(batch_size, image_height, image_width, channels_num), dtype=jnp.float32
     )
 
-    compute_ray_color_in_a_given_world = jit(
-        partial(compute_ray_color, ray_origin=camera.origin, world=world)
+    compute_ray_color_in_concrete_world = jit(
+        partial(
+            compute_ray_color,
+            ray_origin=camera.origin,
+            world=world,
+            lambertian_materials=lambertian_materials,
+            metal_materials=metal_materials,
+        )
     )
-    compute_ray_color_vectorized = vmap(vmap(vmap(compute_ray_color_in_a_given_world)))
+    compute_ray_color_vectorized = vmap(vmap(vmap(compute_ray_color_in_concrete_world)))
 
     batches_num = int(samples_per_pixel / batch_size) + math.ceil(
         samples_per_pixel % batch_size
