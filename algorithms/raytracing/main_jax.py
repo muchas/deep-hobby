@@ -8,6 +8,7 @@ from collections import namedtuple
 from cached_property import cached_property
 from functools import partial
 from typing import Optional, List, Tuple, NamedTuple
+from numpy import number
 from tqdm import tqdm
 
 
@@ -44,10 +45,22 @@ def reflect(ray_direction: jnp.array, normal: jnp.array) -> jnp.array:
 
 
 def refract(vector: jnp.array, normal: jnp.array, refraction_ratio: float) -> jnp.array:
-    cos_theta = min(jnp.dot(-vector, normal), 1.0)
+    cos_theta = jnp.min(jnp.array((jnp.dot(-vector, normal), 1.0)))
     r_out_perp = refraction_ratio * (vector + cos_theta * normal)
     r_out_parallel = -jnp.sqrt(jnp.abs(1.0 - jnp.dot(r_out_perp, r_out_perp))) * normal
     return r_out_perp + r_out_parallel
+
+
+def degrees_to_radians(degrees: float):
+    assert 0 <= degrees <= 360
+    return jnp.pi * degrees / 180.0 
+
+
+def object_index(array, target):
+    for i, element in enumerate(array):
+        if element is target:
+            return i
+    raise Exception("target not found")
 
 
 class Ray(NamedTuple):
@@ -120,14 +133,12 @@ class SceneObject:
     def intersect(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
         raise NotImplemented()
 
-
 class Sphere(SceneObject):
     def __init__(self, origin: jnp.array, radius: float, material_index: int):
         self.origin = origin
         self.radius = radius
         self.material_index = material_index
 
-    @partial(jit, static_argnums=(0,))
     def intersect(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
         material_index = self.material_index
         sphere_origin = self.origin
@@ -141,7 +152,6 @@ class Sphere(SceneObject):
 
         discriminant = b ** 2 - a * c
 
-        @jit
         def intersection(t):
             hitpoint = at(ray, t)
             outward_normal = (hitpoint - sphere_origin) / sphere_radius
@@ -160,7 +170,6 @@ class Sphere(SceneObject):
                 material_index=material_index,
             )
 
-        @jit
         def determine_hitpoint(delta):
             delta_sqrt = jnp.sqrt(delta)
             t1 = (-b + delta_sqrt) / a
@@ -204,29 +213,36 @@ class World:
 class Camera:
     def __init__(
         self,
-        origin: jnp.array,
+        lookfrom: jnp.array,
+        lookat: jnp.array,
+        vector_up: jnp.array,
         image_size: Tuple[int, int],
-        viewport_size: Tuple[int, int],
-        focal_length: float = 1.0,
+        vertical_field_of_view: float,
+        aspect_ratio: float
     ):
-        @jit
-        def compute_ray_direction(relative_y, relative_x):
-            return relative_y * self.__vertical + relative_x * self.__horizontal
-
         image_width, image_height = image_size
-        viewport_width, viewport_height = viewport_size
 
-        self.origin = origin
+        theta = degrees_to_radians(vertical_field_of_view)
+        h = jnp.tan(theta / 2)
+
+        viewport_height = h * 2
+        viewport_width = aspect_ratio * viewport_height
+
+        w = unit(lookfrom - lookat)
+        u = unit(jnp.cross(vector_up, w))
+        v = jnp.cross(w, u)
+
+        self.origin = lookfrom
         self.__image_width = image_width
         self.__image_height = image_height
 
-        self.__vertical = vector(0, viewport_height, 0)
-        self.__horizontal = vector(viewport_width, 0, 0)
+        self.__vertical = v * viewport_height
+        self.__horizontal = u * viewport_width
         self.__bottom_left_corner = (
-            origin
+            self.origin
             - self.__vertical / 2
             - self.__horizontal / 2
-            - vector(0, 0, focal_length)
+            - w
         )
 
         self.__vertical_indices = jnp.arange(self.__image_height).reshape(
@@ -235,6 +251,9 @@ class Camera:
         self.__horizontal_indices = jnp.arange(self.__image_width).reshape(
             1, 1, self.__image_width
         )
+
+        def compute_ray_direction(relative_y, relative_x):
+            return relative_y * self.__vertical + relative_x * self.__horizontal - lookfrom
 
         self.__compute_ray_direction = vmap(vmap(vmap(compute_ray_direction)))
 
@@ -264,8 +283,7 @@ class Camera:
 
 
 class Material:
-    #  TODO(smucha): extract hit_point, normal and ray_direction into a separate primitive
-    def scatter(self, prgn_key, hit_point, normal, ray_direction) -> ScatteredRay:
+    def scatter(self, prgn_key, intersection: Intersection) -> ScatteredRay:
         raise NotImplemented()
 
 
@@ -273,14 +291,17 @@ class Lambertian(NamedTuple):
     albedo: jnp.array
 
     # @partial(jit, static_argnums=(0,))
-    def scatter(self, prgn_key, hit_point, normal, _ray_direction) -> ScatteredRay:
+    def scatter(self, prgn_key, intersection: Intersection) -> ScatteredRay:
         random_unit_vector = unit(
             random.uniform(prgn_key, (3,), minval=-1.0, maxval=1.0)
         )
-        scattered_ray_direction = hit_point + normal + random_unit_vector
+        scattered_ray_direction = (
+            intersection.hit_point + intersection.normal + random_unit_vector
+        )
 
         return ScatteredRay(
-            ray=Ray(hit_point, scattered_ray_direction), attenuation=self.albedo
+            ray=Ray(intersection.hit_point, scattered_ray_direction),
+            attenuation=self.albedo,
         )
 
 
@@ -288,48 +309,56 @@ class Metal(NamedTuple):
     albedo: jnp.array
     fuzziness: float = 0.0
 
-    def scatter(self, prgn_key, hit_point, normal, ray_direction) -> ScatteredRay:
+    def scatter(self, prgn_key, intersection: Intersection) -> ScatteredRay:
         random_unit_vector = unit(
             random.uniform(prgn_key, (3,), minval=-1.0, maxval=1.0)
         )
         reflected_ray_direction = (
-            reflect(ray_direction, normal) + self.fuzziness * random_unit_vector
+            reflect(intersection.ray_direction, intersection.normal)
+            + self.fuzziness * random_unit_vector
         )
         return ScatteredRay(
-            ray=Ray(hit_point, reflected_ray_direction), attenuation=self.albedo
+            ray=Ray(intersection.hit_point, reflected_ray_direction),
+            attenuation=self.albedo,
         )
 
 
-class Dielectric(Material):
-    def __init__(self, index_of_refraction):
-        self.index_of_refraction = index_of_refraction
+class Dielectric(NamedTuple):
+    index_of_refraction: jnp.float32
 
-    def scatter(self, prngn_key, hit_point, normal, ray_direction) -> ScatteredRay:
+    def scatter(self, prgn_key, intersection: Intersection) -> ScatteredRay:
         color = vector(1.0, 1.0, 1.0)
 
-        refraction_ratio = (
-            (1.0 / self.index_of_refraction)
-            if hit_record.front_face
-            else self.index_of_refraction
+        hit_front_face = jnp.dot(intersection.ray_direction, intersection.normal) < 0
+        refraction_ratio = lax.cond(
+            hit_front_face,
+            lambda: (1.0 / self.index_of_refraction),
+            lambda: self.index_of_refraction,
         )
 
-        unit_direction = unit(ray.direction)
-        cos_theta = min(np.dot(-unit_direction, hit_record.normal), 1.0)
-        sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
+        unit_direction = unit(intersection.ray_direction)
+        cos_theta = jnp.min(
+            jnp.array((jnp.dot(-unit_direction, intersection.normal), 1.0))
+        )
+        sin_theta = jnp.sqrt(1.0 - cos_theta * cos_theta)
         cannot_refract = refraction_ratio * sin_theta > 1.0
 
-        if (
-            cannot_refract
-            or self.__reflectance(cos_theta, refraction_ratio) > random.random()
-        ):
-            target_direction = reflect(unit_direction, hit_record.normal)
-        else:
-            target_direction = refract(
-                unit_direction, hit_record.normal, refraction_ratio
-            )
+        reflection_threshold = random.uniform(prgn_key, (1,), minval=0, maxval=1.0)
+
+        target_direction = lax.cond(
+            jnp.all(
+                cannot_refract
+                | (
+                    self.__reflectance(cos_theta, refraction_ratio)
+                    > reflection_threshold
+                )
+            ),
+            lambda: reflect(unit_direction, intersection.normal),
+            lambda: refract(unit_direction, intersection.normal, refraction_ratio),
+        )
 
         return ScatteredRay(
-            ray=Ray(hit_record.point, target_direction), attenuation=color
+            ray=Ray(intersection.hit_point, target_direction), attenuation=color
         )
 
     def __reflectance(self, cosine: float, refraction_ratio: float) -> float:
@@ -337,7 +366,6 @@ class Dielectric(Material):
         r_0 = (1.0 - refraction_ratio) / (1.0 + refraction_ratio)
         r_0 = r_0 * r_0
         return r_0 + (1 - r_0) * ((1 - cosine) ** 5)
-
 
 # @partial(jit, static_argnames=["materials"])
 def scatter_with_material_type(
@@ -348,16 +376,15 @@ def scatter_with_material_type(
         for material_index in range(len(materials))
     ]
     material = tree_map(lambda *x: jnp.select(conditions, x), *materials)
-    return material.scatter(
-        prng_key,
-        intersection.hit_point,
-        intersection.normal,
-        intersection.ray_direction,
-    )
+    return material.scatter(prng_key, intersection)
 
 
 def scatter(
-    prng_key, intersection: Intersection, lambertian_materials, metal_materials
+    prng_key,
+    intersection: Intersection,
+    lambertian_materials,
+    metal_materials,
+    dielectric_materials,
 ) -> ScatteredRay:
     # TODO(smucha): improve disaptch extensibility to multiple material types
     return lax.cond(
@@ -365,12 +392,26 @@ def scatter(
         lambda: scatter_with_material_type(
             prng_key, intersection, lambertian_materials
         ),
-        lambda: scatter_with_material_type(
-            prng_key,
-            intersection._replace(
-                material_index=intersection.material_index - len(lambertian_materials)
+        lambda: lax.cond(
+            intersection.material_index
+            < len(lambertian_materials) + len(metal_materials),
+            lambda: scatter_with_material_type(
+                prng_key,
+                intersection._replace(
+                    material_index=intersection.material_index
+                    - len(lambertian_materials)
+                ),
+                metal_materials,
             ),
-            metal_materials,
+            lambda: scatter_with_material_type(
+                prng_key,
+                intersection._replace(
+                    material_index=intersection.material_index
+                    - len(lambertian_materials)
+                    - len(metal_materials)
+                ),
+                dielectric_materials,
+            ),
         ),
     )
 
@@ -383,6 +424,7 @@ def compute_ray_color(
     world,
     lambertian_materials,
     metal_materials,
+    dielectric_materials,
     max_scatter_steps: int = 4,
 ) -> jnp.array:
     ray = Ray(ray_origin, ray_direction)
@@ -392,7 +434,11 @@ def compute_ray_color(
 
     intersection = world.find_closest_intersection(ray, 0.001, jnp.inf)
     scattered_ray = scatter(
-        prng_keys[0], intersection, lambertian_materials, metal_materials
+        prng_keys[0],
+        intersection,
+        lambertian_materials,
+        metal_materials,
+        dielectric_materials,
     )
     all_hit_records = [HitRecord(intersection, scattered_ray)]
 
@@ -406,7 +452,11 @@ def compute_ray_color(
             lambda: EMPTY_INTERSECTION,
         )
         scattered_ray = scatter(
-            prng_keys[scatter_step], intersection, lambertian_materials, metal_materials
+            prng_keys[scatter_step],
+            intersection,
+            lambertian_materials,
+            metal_materials,
+            dielectric_materials,
         )
         all_hit_records.append(HitRecord(intersection, scattered_ray))
 
@@ -456,6 +506,13 @@ def write_ppm_image(image: jnp.array, max_color: int = 255) -> str:
     return "".join(output_lines)
 
 
+def generate_random_dielectric(prng_key):
+    index_of_refraction = random.uniform(
+        prng_key, shape=(1,), dtype=jnp.float32, minval=0.1, maxval=0.9
+    )
+    return Dielectric(index_of_refraction)
+
+
 def generate_random_lambertian(prng_key):
     albedo = random.uniform(
         prng_key, shape=(3,), dtype=jnp.float32, minval=0.05, maxval=0.95
@@ -476,46 +533,106 @@ def generate_random_metal(prng_key):
     return Metal(albedo, fuzziness=fuzziness)
 
 
-def generate_random_sphere(prng_key, material_idx):
-    x_key, z_key, size_key, material_key = random.split(prng_key, num=4)
-
-    x = random.uniform(x_key, minval=-5, maxval=5)
-    z = random.uniform(z_key, minval=0.0, maxval=2.0)
-    size = random.uniform(size_key, minval=0.1, maxval=0.25)
-    # material_idx = random.choice(material_key, jnp.array(list(range(len(materials))), dtype=jnp.int32))
-
-    return Sphere(vector(x, -0.3, -0.3 - z), size, material_idx)
-
-
 def generate_random_scene(
     prng_key,
     number_of_spheres: int,
     number_of_lambertian_materials: int,
     number_of_metal_materials: int,
+    number_of_dielectric_materials: int,
 ):
+    assert number_of_spheres >= 4, "minimum number of spheres is 4"
+    assert (
+        number_of_lambertian_materials >= 2
+    ), "minimum number of lambertian materials is 2"
+    assert (
+        number_of_dielectric_materials >= 1
+    ), "minimum number of dielectric materials is 1"
+    assert number_of_metal_materials >= 1, "minimum number of metal materials is 1"
+
+    ground_material = Lambertian(color(0.5, 0.5, 0.5))
+    dielectric_material = Dielectric(1.5)
+    lambertian_material = Lambertian(color(0.4, 0.2, 0.1))
+    metal_material = Metal(color(0.7, 0.6, 0.5), 0.0)
+
+    number_of_lambertian_materials -= 2
+    number_of_dielectric_materials -= 1
+    number_of_metal_materials -= 1
+
     # split prng keys
-    lambertian_prng_key, metal_prng_key, scene_prng_key = random.split(prng_key, num=3)
+    (
+        lambertian_prng_key,
+        metal_prng_key,
+        dielectric_prng_key,
+        scene_prng_key,
+    ) = random.split(prng_key, num=4)
 
     lambertian_prng_keys = random.split(
         lambertian_prng_key, num=number_of_lambertian_materials
     )
     lambertian_materials = [
         generate_random_lambertian(key) for key in lambertian_prng_keys
-    ]
+    ] + [ground_material, lambertian_material]
     metal_prng_keys = random.split(metal_prng_key, num=number_of_metal_materials)
-    metal_materials = [generate_random_metal(key) for key in metal_prng_keys]
-    materials = lambertian_materials + metal_materials
-    scene_prng_keys = random.split(scene_prng_key, num=number_of_spheres)
-    scene = [
-        generate_random_sphere(key, material_idx=(i % len(materials))) for i, key in enumerate(scene_prng_keys)
+    metal_materials = [generate_random_metal(key) for key in metal_prng_keys] + [
+        metal_material
     ]
-    return scene, lambertian_materials, metal_materials
+
+    dielectric_prng_keys = random.split(
+        dielectric_prng_key, num=number_of_dielectric_materials
+    )
+    dielectric_materials = [
+        generate_random_dielectric(key) for key in dielectric_prng_keys
+    ] + [dielectric_material]
+
+    materials = lambertian_materials + metal_materials + dielectric_materials
+
+    ground = Sphere(vector(0, -1000, 0), 1000, object_index(materials, ground_material))
+    big_dielectric_sphere = Sphere(
+        vector(0, 1, 0), 1.0, object_index(materials, dielectric_material)
+    )
+    big_lambertian_sphere = Sphere(
+        vector(-4, 1, 0), 1.0, object_index(materials, lambertian_material)
+    )
+    big_metal_sphere = Sphere(vector(4, 1, 0), 1.0, object_index(materials, metal_material))
+
+    sphere_centers = []
+    anchor_point = vector(4, 0.2, 0)
+    coordinates_prng_key = scene_prng_key
+    for a in range(-11, 11):
+        for b in range(-11, 11):
+            coordinates_prng_key, x_key, z_key = random.split(
+                coordinates_prng_key, num=3
+            )
+            center = vector(
+                a + 0.9 * random.uniform(x_key, shape=(1,))[0],
+                0.2,
+                b + 0.9 * random.uniform(z_key, shape=(1,))[0],
+            )
+            if length(center - anchor_point) > 0.9:
+                sphere_centers.append(center)
+
+    number_of_random_spheres = number_of_spheres - 4
+    assert len(sphere_centers) > number_of_random_spheres, "not enough sphere centers"
+
+    sphere_centers = random.shuffle(scene_prng_key, jnp.array(sphere_centers))
+
+    random_spheres = [
+        Sphere(center, 0.2, material_index=(i % len(materials)))
+        for i, center in zip(range(number_of_random_spheres), sphere_centers)
+    ]
+    scene = [
+        ground,
+        big_dielectric_sphere,
+        big_lambertian_sphere,
+        big_metal_sphere,
+    ] + random_spheres
+    return scene, lambertian_materials, metal_materials, dielectric_materials
 
 
 def main():
     seed = 7
-    aspect_ratio = 16 / 9
-    image_width = 512
+    aspect_ratio = 3.0 / 2.0
+    image_width = 800
     image_height = int(image_width / aspect_ratio)
 
     viewport_height = 2
@@ -524,29 +641,32 @@ def main():
 
     starting_key = random.PRNGKey(seed)
     camera = Camera(
-        origin=vector(0, 0, 0),
+        lookfrom=vector(13, 2, 3),
+        lookat=vector(0, 0, 0),
+        vector_up=vector(0, 1, 0),
         image_size=(image_width, image_height),
         viewport_size=(viewport_width, viewport_height),
     )
 
-    scene, lambertian_materials, metal_materials = generate_random_scene(
+    (
+        scene,
+        lambertian_materials,
+        metal_materials,
+        dielectric_materials,
+    ) = generate_random_scene(
         starting_key,
-        number_of_spheres=15,
-        number_of_lambertian_materials=1,
-        number_of_metal_materials=6,
+        number_of_spheres=50,
+        number_of_lambertian_materials=3,
+        number_of_metal_materials=5,
+        number_of_dielectric_materials=4,
     )
 
-    material_ground = Lambertian(vector(0.8, 0.8, 0.0))
-
-    lambertian_materials.append(material_ground)
-    scene.append(Sphere(vector(0.0, -100.5, -1.0), 100, len(lambertian_materials) - 1))
-
-    materials = lambertian_materials + metal_materials
+    materials = lambertian_materials + metal_materials + dielectric_materials
 
     world = World(scene)
 
-    samples_per_pixel = 50
-    batch_size = 10
+    samples_per_pixel = 500
+    batch_size = 5
 
     pixel_colors = jnp.zeros(
         shape=(batch_size, image_height, image_width, channels_num), dtype=jnp.float32
@@ -559,6 +679,7 @@ def main():
             world=world,
             lambertian_materials=lambertian_materials,
             metal_materials=metal_materials,
+            dielectric_materials=dielectric_materials,
         )
     )
     compute_ray_color_vectorized = vmap(vmap(vmap(compute_ray_color_in_concrete_world)))
@@ -568,12 +689,12 @@ def main():
     )
     batch_prng_keys = random.split(starting_key, num=batches_num)
 
-    seeds = (
-        random.uniform(starting_key, (batch_size, image_height, image_width, 1)) * 1000
-    ).astype(int)
-
     for batch_index in tqdm(range(batches_num), desc="sampling rays"):
         key = batch_prng_keys[batch_index]
+        seeds = (
+            random.uniform(key, (batch_size, image_height, image_width, 1)) * 1000
+        ).astype(int)
+
         ray_directions = camera.get_ray_directions(
             key, batch_size
         )  # B x H x W x DIRECTION_DIM (3)
@@ -590,16 +711,16 @@ def save_computation_graph():
     aspect_ratio = 16 / 9
     image_width = 512
     image_height = int(image_width / aspect_ratio)
-
-    viewport_height = 2
-    viewport_width = viewport_height * aspect_ratio
     channels_num = 3
 
     starting_key = random.PRNGKey(seed)
     camera = Camera(
-        origin=vector(0, 0, 0),
+        lookfrom=vector(13, 2, 3),
+        lookat=vector(0, 0, 0),
+        vector_up=vector(0, 1, 0),
         image_size=(image_width, image_height),
-        viewport_size=(viewport_width, viewport_height),
+        vertical_field_of_view=20,
+        aspect_ratio=aspect_ratio
     )
 
     # starting_scene = [
@@ -608,17 +729,17 @@ def save_computation_graph():
     # ]
 
     second_scene = [
-        Sphere(vector(-1, 0, -0.75), 0.2, Lambertian()),
-        Sphere(vector(1, 0, -1), 0.5, Lambertian()),
-        Sphere(vector(0, -0.2, -1.5), 0.25, Metal()),
-        Sphere(vector(-0.6, -0.2, -1.5), 0.25, Metal()),
+        # Sphere(vector(-1, 0, -0.75), 0.2, Lambertian()),
+        # Sphere(vector(1, 0, -1), 0.5, Lambertian()),
+        # Sphere(vector(0, -0.2, -1.5), 0.25, Metal()),
+        # Sphere(vector(-0.6, -0.2, -1.5), 0.25, Metal()),
         Sphere(vector(0.0, -100.5, -1.0), 100, Lambertian()),  # ground
     ]
 
     world = World(second_scene)
 
-    samples_per_pixel = 50
-    batch_size = 10
+    samples_per_pixel = 6
+    batch_size = 3
 
     pixel_colors = jnp.zeros(
         shape=(batch_size, image_height, image_width, channels_num), dtype=jnp.float32
