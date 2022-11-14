@@ -129,85 +129,92 @@ MISSED_HIT_RECORD = HitRecord(
 )
 
 
-class SceneObject:
-    def intersect(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
-        raise NotImplemented()
+class Sphere(NamedTuple):
+    origin: jnp.array
+    radius: jnp.float32
+    material_index: jnp.int32
 
-class Sphere(SceneObject):
-    def __init__(self, origin: jnp.array, radius: float, material_index: int):
-        self.origin = origin
-        self.radius = radius
-        self.material_index = material_index
 
-    def intersect(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
-        material_index = self.material_index
-        sphere_origin = self.origin
-        sphere_radius = self.radius
+def intersect_with_sphere(sphere: Sphere, ray: Ray, t_min: float, t_max: float) -> Intersection:
+    diff_v = ray.origin - sphere.origin
 
-        diff_v = ray.origin - sphere_origin
+    a = jnp.dot(ray.direction, ray.direction)
+    b = jnp.dot(ray.direction, diff_v)
+    c = jnp.dot(diff_v, diff_v) - sphere.radius ** 2
 
-        a = jnp.dot(ray.direction, ray.direction)
-        b = jnp.dot(ray.direction, diff_v)
-        c = jnp.dot(diff_v, diff_v) - self.radius ** 2
+    discriminant = b ** 2 - a * c
 
-        discriminant = b ** 2 - a * c
+    def intersection(t):
+        hitpoint = at(ray, t)
+        outward_normal = (hitpoint - sphere.origin) / sphere.radius
 
-        def intersection(t):
-            hitpoint = at(ray, t)
-            outward_normal = (hitpoint - sphere_origin) / sphere_radius
-
-            normal = lax.cond(
-                jnp.dot(ray.direction, outward_normal) < 0,
-                lambda: outward_normal,
-                lambda: -outward_normal,
-            )
-            return Intersection(
-                was_hit=jnp.array([True], dtype=jnp.int32),
-                ray_direction=ray.direction,
-                t=t,
-                hit_point=hitpoint,
-                normal=normal,
-                material_index=material_index,
-            )
-
-        def determine_hitpoint(delta):
-            delta_sqrt = jnp.sqrt(delta)
-            t1 = (-b + delta_sqrt) / a
-            t2 = (-b - delta_sqrt) / a
-            return lax.cond(
-                (t_min < t1) & (t1 < t2),
-                lambda: intersection(t1),
-                lambda: lax.cond(
-                    t_min < t2, lambda: intersection(t2), lambda: EMPTY_INTERSECTION
-                ),
-            )
-
-        return lax.cond(
-            discriminant > 0,
-            lambda: determine_hitpoint(discriminant),
-            lambda: EMPTY_INTERSECTION,
+        normal = lax.cond(
+            jnp.dot(ray.direction, outward_normal) < 0,
+            lambda: outward_normal,
+            lambda: -outward_normal,
         )
+        return Intersection(
+            was_hit=jnp.array([True], dtype=jnp.int32),
+            ray_direction=ray.direction,
+            t=t,
+            hit_point=hitpoint,
+            normal=normal,
+            material_index=sphere.material_index,
+        )
+
+    def determine_hitpoint(delta):
+        delta_sqrt = jnp.sqrt(delta)
+        t1 = (-b + delta_sqrt) / a
+        t2 = (-b - delta_sqrt) / a
+        return lax.cond(
+            (t_min < t1) & (t1 < t2),
+            lambda: intersection(t1),
+            lambda: lax.cond(
+                t_min < t2, lambda: intersection(t2), lambda: EMPTY_INTERSECTION
+            ),
+        )
+
+    return lax.cond(
+        discriminant > 0,
+        lambda: determine_hitpoint(discriminant),
+        lambda: EMPTY_INTERSECTION,
+    )
+
+
+# class RaymarchingWorld:
+
+#     def __init__(self, scene_objects) -> None:
+#         self.scene_objects = scene_objects
+
+#     def find_closest_intersection(self, ray: Ray, t_min: float, t_max: float) -> Intersection:
+#         starting_point = at(ray, t_min)
+
+#         current_point = starting_point
+#         min_distance = jnp.inf
+#         epsillon = 0.005
+
+#         while min_distance > epsillon:
+#             distances = [scene_object.distance_from(current_point) for scene_object in self.scene_objects]
+#             jnp.min()
+#         pass
 
 
 class World:
-    def __init__(self, scene_objects: List[SceneObject]):
-        self.scene_objects = scene_objects
+    def __init__(self, spheres: List[Sphere]):
+        self.spheres_number = len(spheres)
+        self.vectorized_spheres = tree_map(lambda *x: jnp.stack(x), *spheres)
 
-    @partial(jit, static_argnums=(0,))
     def find_closest_intersection(
         self, ray: Ray, t_min: float, t_max: float
     ) -> Intersection:
-        intersections = [
-            scene_object.intersect(ray, t_min, t_max)
-            for scene_object in self.scene_objects
-        ]
-        min_t_object_index = jnp.argmin(
-            jnp.stack([intersection.t for intersection in intersections])
-        )
+        intersect_ray_with_sphere = partial(intersect_with_sphere, ray=ray, t_min=t_min, t_max=t_max)
+        vectorized_intersections = vmap(intersect_ray_with_sphere)(self.vectorized_spheres)
+
+        min_t_object_index = jnp.argmin(vectorized_intersections.t)
         conditions = [
-            min_t_object_index == obj_idx for obj_idx in range(len(intersections))
+            min_t_object_index == obj_idx for obj_idx in range(self.spheres_number)
         ]
-        return tree_map(lambda *x: jnp.select(conditions, x), *intersections)
+        return tree_map(lambda x: jnp.select(conditions, x), vectorized_intersections)
 
 
 class Camera:
@@ -634,9 +641,6 @@ def main():
     aspect_ratio = 3.0 / 2.0
     image_width = 800
     image_height = int(image_width / aspect_ratio)
-
-    viewport_height = 2
-    viewport_width = viewport_height * aspect_ratio
     channels_num = 3
 
     starting_key = random.PRNGKey(seed)
@@ -645,7 +649,8 @@ def main():
         lookat=vector(0, 0, 0),
         vector_up=vector(0, 1, 0),
         image_size=(image_width, image_height),
-        viewport_size=(viewport_width, viewport_height),
+        vertical_field_of_view=20,
+        aspect_ratio=aspect_ratio
     )
 
     (
